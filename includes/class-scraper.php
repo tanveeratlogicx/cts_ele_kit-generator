@@ -56,14 +56,43 @@ class Scraper {
 		}
 
 		$colors = $this->extract_colors( $body . "\n" . $css_contents );
+        // Normalize colors and drop very transparent entries, collapse near-duplicates.
+        $colors = $this->normalize_colors_list( $colors );
 		$fonts  = $this->extract_fonts( $body . "\n" . $css_contents );
+		$sizes  = $this->extract_font_sizes( $css_contents );
+        $vars   = $this->extract_css_vars( $css_contents );
 
 		$colors = $this->rank_and_limit_colors( $colors, 12 );
 		$fonts  = $this->rank_and_limit_fonts( $fonts, 4 );
+        $bg = $this->extract_background_color( $css_contents );
+        $labeled = $this->label_colors( $colors, $bg );
+        // Merge CSS variables into labels/sizes when meaningful.
+        if ( ! empty( $vars['colors'] ) ) {
+            foreach ( $vars['colors'] as $name => $val ) {
+                $lname = strtolower( $name );
+                if ( false !== strpos( $lname, 'primary' ) ) { $labeled['primary'] = $val; }
+                if ( false !== strpos( $lname, 'secondary' ) ) { $labeled['secondary'] = $val; }
+                if ( false !== strpos( $lname, 'text' ) ) { $labeled['text'] = $val; }
+                if ( false !== strpos( $lname, 'accent' ) || false !== strpos( $lname, 'brand' ) ) { $labeled['accent'] = $val; }
+            }
+        }
+        if ( ! empty( $vars['font_sizes'] ) ) {
+            $map = [ 'base' => ['base','body','root'], 'h1'=>['h1'], 'h2'=>['h2'], 'h3'=>['h3'], 'h4'=>['h4'], 'h5'=>['h5'], 'h6'=>['h6'] ];
+            foreach ( $vars['font_sizes'] as $name => $val ) {
+                $lname = strtolower( $name );
+                foreach ( $map as $key => $needles ) {
+                    foreach ( $needles as $needle ) {
+                        if ( false !== strpos( $lname, $needle ) ) { $sizes[ $key ] = $val; break 2; }
+                    }
+                }
+            }
+        }
 
 		return [
-			'colors' => array_slice( array_values( array_unique( $colors ) ), 0, 8 ),
-			'fonts'  => array_slice( array_values( array_unique( $fonts ) ), 0, 3 ),
+			'colors'          => array_slice( array_values( array_unique( $colors ) ), 0, 8 ),
+			'labeled_colors'  => $labeled,
+			'fonts'           => array_slice( array_values( array_unique( $fonts ) ), 0, 3 ),
+			'font_sizes'      => $sizes,
 		];
 	}
 
@@ -105,6 +134,175 @@ class Scraper {
 		}
 		return $fonts;
 	}
+
+	private function extract_font_sizes( string $css ): array {
+		$result = [
+			'base' => null,
+			'h1' => null,
+			'h2' => null,
+			'h3' => null,
+			'h4' => null,
+			'h5' => null,
+			'h6' => null,
+		];
+		$search = [
+			'base' => '(?:html|:root|body)\s*\{[^}]*font-size\s*:\s*([^;}{]+);',
+			'h1' => 'h1\s*\{[^}]*font-size\s*:\s*([^;}{]+);',
+			'h2' => 'h2\s*\{[^}]*font-size\s*:\s*([^;}{]+);',
+			'h3' => 'h3\s*\{[^}]*font-size\s*:\s*([^;}{]+);',
+			'h4' => 'h4\s*\{[^}]*font-size\s*:\s*([^;}{]+);',
+			'h5' => 'h5\s*\{[^}]*font-size\s*:\s*([^;}{]+);',
+			'h6' => 'h6\s*\{[^}]*font-size\s*:\s*([^;}{]+);',
+		];
+		foreach ( $search as $key => $pattern ) {
+			if ( \preg_match( '/' . $pattern . '/i', $css, $m ) ) {
+				$result[ $key ] = trim( $m[1] );
+			}
+		}
+		return $result;
+	}
+
+	private function extract_css_vars( string $css ): array {
+        $vars = [ 'colors' => [], 'font_sizes' => [] ];
+        if ( \preg_match_all( '/--([a-z0-9\-_]+)\s*:\s*([^;}{]+);/i', $css, $m ) ) {
+            foreach ( $m[1] as $i => $name ) {
+                $val = trim( $m[2][ $i ] );
+                // Strip !important etc.
+                $val = preg_replace( '/!\s*important/i', '', $val );
+                if ( \preg_match( '/^(#|rgb)/i', $val ) ) {
+                    $vars['colors'][ '--' . $name ] = $val;
+                } elseif ( \preg_match( '/^(?:\d+(?:\.\d+)?(px|rem|em|%)|clamp\(|calc\(|var\()/i', $val ) ) {
+                    $vars['font_sizes'][ '--' . $name ] = $val;
+                }
+            }
+        }
+        return $vars;
+    }
+
+	private function label_colors( array $colors, ?string $bg = null ): array {
+        $labels = [ 'primary' => null, 'secondary' => null, 'text' => null, 'accent' => null ];
+        if ( empty( $colors ) ) { return $labels; }
+        $metrics = [];
+        foreach ( $colors as $c ) {
+            $rgb = $this->to_rgb( $c );
+            if ( ! $rgb ) { continue; }
+            list( $r,$g,$b,$a ) = $rgb;
+            $lum = 0.2126 * ($r/255) + 0.7152 * ($g/255) + 0.0722 * ($b/255);
+            $max = max($r,$g,$b); $min = min($r,$g,$b); $sat = ($max===0)?0:(($max-$min)/$max);
+            $metrics[] = [ 'c'=>$c, 'lum'=>$lum, 'sat'=>$sat, 'a'=>$a ];
+        }
+        if ( empty( $metrics ) ) { return $labels; }
+        // Background
+        $bg_rgb = $bg ? $this->to_rgb( $bg ) : null;
+        // Text: prefer highest contrast vs background, else darkest opaque.
+        $opaque = array_values( array_filter( $metrics, function($m){ return $m['a'] === null || $m['a'] >= 0.8; }) );
+        if ( $bg_rgb ) {
+            usort( $opaque, function($x,$y) use ($bg_rgb) {
+                $cx = $this->contrast_ratio_rgb( $this->to_rgb_components($x['c']), $bg_rgb );
+                $cy = $this->contrast_ratio_rgb( $this->to_rgb_components($y['c']), $bg_rgb );
+                return $cy <=> $cx; // desc
+            });
+        } else {
+            usort( $opaque, function($x,$y){ return $x['lum'] <=> $y['lum']; });
+        }
+        $labels['text'] = $opaque[0]['c'] ?? $metrics[0]['c'];
+        // Accent: highest saturation.
+        $cand = array_values( array_filter( $metrics, function($m){ return $m['sat'] >= 0.2; } ) );
+        if ( empty( $cand ) ) { $cand = $metrics; }
+        usort( $cand, function($x,$y){ return ($y['sat'] <=> $x['sat']) ?: ($x['lum'] <=> $y['lum']); });
+        $labels['accent'] = $cand[0]['c'];
+        // Primary/Secondary: first remaining distinct colors.
+        $used = [ strtolower($labels['text']), strtolower($labels['accent']) ];
+        $prim = null; $sec = null;
+        foreach ( $colors as $c ) {
+            $lc = strtolower($c);
+            if ( in_array( $lc, $used, true ) ) { continue; }
+            if ( ! $prim ) { $prim = $c; $used[] = $lc; continue; }
+            $sec = $c; break;
+        }
+        $labels['primary'] = $prim ?? $colors[0];
+        $labels['secondary'] = $sec ?? ($colors[1] ?? $colors[0]);
+        return $labels;
+    }
+
+	private function to_rgb( string $c ) {
+        $c = trim( strtolower( $c ) );
+        if ( 0 === strpos( $c, '#' ) ) {
+            $h = substr( $c, 1 );
+            if ( strlen( $h ) === 3 ) {
+                $r = hexdec( str_repeat( $h[0], 2 ) );
+                $g = hexdec( str_repeat( $h[1], 2 ) );
+                $b = hexdec( str_repeat( $h[2], 2 ) );
+                return [ $r,$g,$b,null ];
+            }
+            if ( strlen( $h ) === 6 ) {
+                $r = hexdec( substr( $h,0,2 ) );
+                $g = hexdec( substr( $h,2,2 ) );
+                $b = hexdec( substr( $h,4,2 ) );
+                return [ $r,$g,$b,null ];
+            }
+        }
+        if ( 0 === strpos( $c, 'rgb' ) ) {
+            if ( \preg_match( '/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*(\d*\.?\d+))?\s*\)/', $c, $m ) ) {
+                $r = (int) $m[1]; $g = (int) $m[2]; $b = (int) $m[3];
+                $a = isset($m[4]) ? (float) $m[4] : null;
+                return [ $r,$g,$b,$a ];
+            }
+        }
+        return null;
+    }
+
+    private function to_rgb_components( string $c ): array {
+        $rgb = $this->to_rgb( $c );
+        if ( ! $rgb ) { return [0,0,0]; }
+        return [ $rgb[0], $rgb[1], $rgb[2] ];
+    }
+
+    private function contrast_ratio_rgb( array $rgb1, array $rgb2 ): float {
+        $L = function($c){ list($r,$g,$b)=$c; $toLin=function($v){$v=$v/255; return $v<=0.03928? $v/12.92 : pow(($v+0.055)/1.055,2.4);}; $R=$toLin($r);$G=$toLin($g);$B=$toLin($b); return 0.2126*$R+0.7152*$G+0.0722*$B; };
+        $L1 = $L($rgb1); $L2 = $L($rgb2); if ($L1<$L2){ list($L1,$L2)=[$L2,$L1]; }
+        return ($L1+0.05)/($L2+0.05);
+    }
+
+    private function normalize_colors_list( array $colors ): array {
+        $norm = [];
+        foreach ( $colors as $c ) {
+            $rgb = $this->to_rgb( $c );
+            if ( ! $rgb ) { continue; }
+            // Drop very transparent
+            if ( isset($rgb[3]) && $rgb[3] !== null && $rgb[3] < 0.5 ) { continue; }
+            $hex = sprintf( '#%02x%02x%02x', max(0,min(255,$rgb[0])), max(0,min(255,$rgb[1])), max(0,min(255,$rgb[2])) );
+            $norm[] = $hex;
+        }
+        // De-duplicate near-equals (RGB distance < 20)
+        $out = [];
+        foreach ( $norm as $hex ) {
+            $rgb = $this->to_rgb( $hex );
+            $keep = true;
+            foreach ( $out as $existing ) {
+                $e = $this->to_rgb( $existing );
+                $dist = sqrt( pow($rgb[0]-$e[0],2) + pow($rgb[1]-$e[1],2) + pow($rgb[2]-$e[2],2) );
+                if ( $dist < 20 ) { $keep = false; break; }
+            }
+            if ( $keep ) { $out[] = strtolower($hex); }
+        }
+        return $out;
+    }
+
+    private function extract_background_color( string $css ): ?string {
+        if ( \preg_match( '/body\s*\{[^}]*background(?:-color)?\s*:\s*([^;}{]+);/i', $css, $m ) ) {
+            $val = trim( $m[1] );
+            // Resolve var(--x) if present
+            if ( \preg_match( '/var\((--[a-z0-9\-_]+)\)/i', $val, $vm ) ) {
+                // Try to find the var value in CSS
+                if ( \preg_match( '/'.preg_quote($vm[1],'/' ).'\s*:\s*([^;}{]+);/i', $css, $def ) ) {
+                    $val = trim( $def[1] );
+                }
+            }
+            return $val;
+        }
+        return null;
+    }
 
 	private function extract_stylesheet_links( string $html, string $base ): array {
 		$links = [];

@@ -22,8 +22,23 @@ class REST_Controller {
 				'args'                => [
 					'url'   => [ 'type' => 'string', 'required' => true ],
 					'apply' => [ 'type' => 'boolean', 'required' => false, 'default' => false ],
+					'overrides' => [ 'type' => 'object', 'required' => false ],
 				],
 				'callback'            => [ $this, 'handle_generate' ],
+			] );
+			\register_rest_route( 'cts-ekg/v1', '/restore', [
+				'methods'             => 'POST',
+				'permission_callback' => function () {
+					return \current_user_can( 'manage_options' );
+				},
+				'callback'            => [ $this, 'handle_restore' ],
+			] );
+			\register_rest_route( 'cts-ekg/v1', '/diagnostics', [
+				'methods'             => 'POST',
+				'permission_callback' => function () {
+					return \current_user_can( 'manage_options' );
+				},
+				'callback'            => [ $this, 'handle_diagnostics' ],
 			] );
 		} );
 	}
@@ -55,6 +70,25 @@ class REST_Controller {
 
 		try {
 			$analysis = $this->scraper->analyze( $url );
+			// Merge overrides if provided.
+			$overrides = [];
+			if ( is_array( $request ) ) {
+				$overrides = isset( $request['overrides'] ) && is_array( $request['overrides'] ) ? $request['overrides'] : [];
+			} elseif ( is_object( $request ) && method_exists( $request, 'get_param' ) ) {
+				$ov = $request->get_param( 'overrides' );
+				if ( is_array( $ov ) ) { $overrides = $ov; }
+			}
+			if ( ! empty( $overrides ) ) {
+				if ( ! empty( $overrides['labeled_colors'] ) && is_array( $overrides['labeled_colors'] ) ) {
+					$analysis['labeled_colors'] = array_merge( $analysis['labeled_colors'] ?? [], $overrides['labeled_colors'] );
+				}
+				if ( ! empty( $overrides['font_sizes'] ) && is_array( $overrides['font_sizes'] ) ) {
+					$analysis['font_sizes'] = array_merge( $analysis['font_sizes'] ?? [], $overrides['font_sizes'] );
+				}
+				if ( ! empty( $overrides['font_families'] ) && is_array( $overrides['font_families'] ) ) {
+					$analysis['font_families'] = array_merge( $analysis['font_families'] ?? [], $overrides['font_families'] );
+				}
+			}
 			if ( isset( $analysis['error'] ) ) {
 				return [ 'ok' => false, 'message' => $analysis['error'] ];
 			}
@@ -66,6 +100,24 @@ class REST_Controller {
 			return array_merge( [ 'analysis' => $analysis ], $result );
 		} catch ( \Throwable $e ) {
 			return [ 'ok' => false, 'message' => \__( 'Unexpected error while generating kit.', 'cts-ele-kit' ) ];
+		}
+	}
+
+	public function handle_restore( $request ) {
+		try {
+			$result = $this->kit_generator->restore_last_backup();
+			return $result;
+		} catch ( \Throwable $e ) {
+			return [ 'ok' => false, 'message' => \__( 'Unexpected error while restoring.', 'cts-ele-kit' ) ];
+		}
+	}
+
+	public function handle_diagnostics( $request ) {
+		try {
+			$result = $this->kit_generator->get_active_kit_settings();
+			return $result;
+		} catch ( \Throwable $e ) {
+			return [ 'ok' => false, 'message' => \__( 'Unexpected error while reading diagnostics.', 'cts-ele-kit' ) ];
 		}
 	}
 }
